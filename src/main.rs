@@ -50,22 +50,19 @@ struct Recording {
 }
 
 fn main() {
-    let args = parse_args();
-
-    if args.help {
-        print_help();
-        return;
-    }
+    let args = Args::parse();
 
     // Register console close / Ctrl+C handler
     unsafe {
         SetConsoleCtrlHandler(Some(console_ctrl_handler), 1);
     }
 
-    // Register global hotkeys
+    // Parse and register global hotkeys
+    let rec_hotkey = args.parsed_rec_hotkey();
+    let quit_hotkey = args.parsed_quit_hotkey();
     unsafe {
-        RegisterHotKey(None, HOTKEY_TOGGLE, args.rec_hotkey.0, args.rec_hotkey.1).unwrap();
-        RegisterHotKey(None, HOTKEY_QUIT, args.quit_hotkey.0, args.quit_hotkey.1).unwrap();
+        RegisterHotKey(None, HOTKEY_TOGGLE, rec_hotkey.0, rec_hotkey.1).unwrap();
+        RegisterHotKey(None, HOTKEY_QUIT, quit_hotkey.0, quit_hotkey.1).unwrap();
     }
 
     // Check privilege level
@@ -75,7 +72,7 @@ fn main() {
 
     output::info(format!(
         "KeyReel ready. Press {} to start/stop recording, {} to quit.",
-        args.rec_hotkey_label, args.quit_hotkey_label
+        args.rec_hotkey, args.quit_hotkey
     ));
 
     let mut recording: Option<Recording> = None;
@@ -377,80 +374,66 @@ fn is_elevated() -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// CLI parsing
+// CLI parsing (clap)
 // ---------------------------------------------------------------------------
 
+use clap::Parser;
+
+/// Portable Windows screen recorder with keystroke logging.
+///
+/// Records screen, system audio, and microphone into an MP4 file,
+/// and logs every keystroke to an SRT subtitle file and a JSONL raw log.
+/// All output files are written next to the executable.
+#[derive(Parser)]
+#[command(name = "KeyReel", version, after_help = "\
+HOTKEY FORMAT:
+    Modifier+...+Key  (e.g. Ctrl+Alt+Shift+R, Ctrl+F12)
+    Modifiers: Ctrl, Alt, Shift
+    Keys: A-Z, 0-9, F1-F24
+
+OUTPUT FILES:
+    session_<timestamp>.mp4    Video + audio recording
+    session_<timestamp>.srt    Keystroke subtitles
+    session_<timestamp>.jsonl  Raw keystroke log (one JSON object per line)
+
+EXAMPLES:
+    key_reel.exe
+    key_reel.exe --window \"DOSBox\" --only-exe dosbox.exe
+    key_reel.exe --rec-hotkey Ctrl+F9 --quit-hotkey Ctrl+F10")]
 pub struct Args {
-    help: bool,
+    /// Capture a specific window (title substring match). Default: primary monitor.
+    #[arg(long)]
     pub window: Option<String>,
+
+    /// Hide the cursor in the recording.
+    #[arg(long)]
     pub no_cursor: bool,
+
+    /// Filter subtitles to only show keys when this executable is in the foreground (e.g. dosbox.exe).
+    #[arg(long)]
     pub only_exe: Option<String>,
-    rec_hotkey: (windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS, u32),
-    rec_hotkey_label: String,
-    quit_hotkey: (windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS, u32),
-    quit_hotkey_label: String,
+
+    /// Hotkey to toggle recording.
+    #[arg(long, default_value = "Ctrl+Alt+Shift+R")]
+    pub rec_hotkey: String,
+
+    /// Hotkey to quit.
+    #[arg(long, default_value = "Ctrl+Alt+Shift+Q")]
+    pub quit_hotkey: String,
 }
 
-fn parse_args() -> Args {
-    let args: Vec<String> = std::env::args().collect();
-    let mut result = Args {
-        help: false,
-        window: None,
-        no_cursor: false,
-        only_exe: None,
-        rec_hotkey: (MOD_CONTROL | MOD_ALT | MOD_SHIFT, 'R' as u32),
-        rec_hotkey_label: "Ctrl+Alt+Shift+R".to_string(),
-        quit_hotkey: (MOD_CONTROL | MOD_ALT | MOD_SHIFT, 'Q' as u32),
-        quit_hotkey_label: "Ctrl+Alt+Shift+Q".to_string(),
-    };
-
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--help" | "-h" => result.help = true,
-            "--window" => {
-                i += 1;
-                if i < args.len() {
-                    result.window = Some(args[i].clone());
-                }
-            }
-            "--no-cursor" => result.no_cursor = true,
-            "--only-exe" => {
-                i += 1;
-                if i < args.len() {
-                    result.only_exe = Some(args[i].clone());
-                }
-            }
-            "--rec-hotkey" => {
-                i += 1;
-                if i < args.len() {
-                    if let Some(parsed) = parse_hotkey_combo(&args[i]) {
-                        result.rec_hotkey = parsed;
-                        result.rec_hotkey_label = args[i].clone();
-                    } else {
-                        output::error(format!("Invalid hotkey combo: {}", args[i]));
-                    }
-                }
-            }
-            "--quit-hotkey" => {
-                i += 1;
-                if i < args.len() {
-                    if let Some(parsed) = parse_hotkey_combo(&args[i]) {
-                        result.quit_hotkey = parsed;
-                        result.quit_hotkey_label = args[i].clone();
-                    } else {
-                        output::error(format!("Invalid hotkey combo: {}", args[i]));
-                    }
-                }
-            }
-            other => {
-                output::warn(format!("Unknown argument: {other}"));
-            }
-        }
-        i += 1;
+impl Args {
+    /// Parse the rec_hotkey string into (modifiers, vk).
+    pub fn parsed_rec_hotkey(&self) -> (windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS, u32) {
+        parse_hotkey_combo(&self.rec_hotkey)
+            .unwrap_or((MOD_CONTROL | MOD_ALT | MOD_SHIFT, 'R' as u32))
     }
 
-    result
+    /// Parse the quit_hotkey string into (modifiers, vk).
+    pub fn parsed_quit_hotkey(&self) -> (windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS, u32) {
+        parse_hotkey_combo(&self.quit_hotkey)
+            .unwrap_or((MOD_CONTROL | MOD_ALT | MOD_SHIFT, 'Q' as u32))
+    }
 }
 
 /// Parses a hotkey combo string like "Ctrl+Alt+Shift+R" into (modifiers, vk).
@@ -485,40 +468,4 @@ fn parse_hotkey_combo(
     }
 
     vk.map(|k| (mods, k))
-}
-
-fn print_help() {
-    let help = r#"KeyReel - Portable Windows screen recorder with keystroke logging
-
-USAGE:
-    key_reel.exe [OPTIONS]
-
-OPTIONS:
-    --help, -h              Print this help message
-    --window <SUBSTRING>    Capture a specific window (title substring match)
-                            Default: primary monitor
-    --no-cursor             Hide the cursor in the recording
-    --only-exe <NAME>       Filter subtitles to only show keys when this
-                            executable is in the foreground (e.g. dosbox.exe)
-    --rec-hotkey <COMBO>    Hotkey to toggle recording (default: Ctrl+Alt+Shift+R)
-    --quit-hotkey <COMBO>   Hotkey to quit (default: Ctrl+Alt+Shift+Q)
-
-HOTKEY FORMAT:
-    Modifier+...+Key  (e.g. Ctrl+Alt+Shift+R, Ctrl+F12)
-    Modifiers: Ctrl, Alt, Shift
-    Keys: A-Z, 0-9, F1-F24
-
-OUTPUT FILES:
-    session_<timestamp>.mp4    Video + audio recording
-    session_<timestamp>.srt    Keystroke subtitles
-    session_<timestamp>.jsonl  Raw keystroke log (one JSON object per line)
-
-    All files are written next to the executable.
-
-EXAMPLES:
-    key_reel.exe
-    key_reel.exe --window "DOSBox" --only-exe dosbox.exe
-    key_reel.exe --rec-hotkey Ctrl+F9 --quit-hotkey Ctrl+F10
-"#;
-    print!("{help}");
 }
