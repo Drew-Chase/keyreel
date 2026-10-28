@@ -215,12 +215,11 @@ fn start_recording(args: &Args) -> Result<Recording, Box<dyn std::error::Error>>
     let video_stop = Arc::clone(&stop_flag);
     let window_title = args.window.clone();
     let no_cursor = args.no_cursor;
-    let epoch = session.epoch();
     let video_handle = std::thread::Builder::new()
         .name("video".into())
         .spawn(move || {
             if let Err(e) =
-                video::start_capture(window_title.as_deref(), no_cursor, frame_tx, video_stop, epoch)
+                video::start_capture(window_title.as_deref(), no_cursor, frame_tx, video_stop)
             {
                 eprintln!("Video capture error: {e}");
             }
@@ -456,12 +455,10 @@ fn parse_hotkey_combo(
                     vk = Some(part.to_ascii_uppercase().as_bytes()[0] as u32);
                 } else if let Some(stripped) =
                     part.strip_prefix('F').or_else(|| part.strip_prefix('f'))
+                    && let Ok(n) = stripped.parse::<u32>()
+                    && (1..=24).contains(&n)
                 {
-                    if let Ok(n) = stripped.parse::<u32>() {
-                        if (1..=24).contains(&n) {
-                            vk = Some(0x70 + n - 1);
-                        }
-                    }
+                    vk = Some(0x70 + n - 1);
                 }
             }
         }

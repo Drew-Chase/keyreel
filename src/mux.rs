@@ -9,8 +9,6 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 /// A video frame received from the capture thread.
 pub struct VideoFrame {
     pub data: Vec<u8>,
-    pub width: u32,
-    pub height: u32,
     pub timestamp_100ns: i64,
 }
 

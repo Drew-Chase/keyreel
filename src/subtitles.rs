@@ -77,7 +77,7 @@ impl SubtitleWriter {
         let label = build_label(&event.label, &event.mods);
 
         // Is this a "typeable" single character (for grouping purposes)?
-        let is_single_char = label.len() == 1 && label.chars().next().map_or(false, |c| !c.is_control());
+        let is_single_char = label.len() == 1 && label.chars().next().is_some_and(|c| !c.is_control());
 
         // Clear any pending modifier-only keys (they got consumed by this key)
         self.pending_mods_down.clear();

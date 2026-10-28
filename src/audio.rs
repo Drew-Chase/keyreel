@@ -85,26 +85,22 @@ fn run_capture(
     stop_flag: &Arc<AtomicBool>,
     fmt_tx: &mpsc::Sender<Result<AudioFormat, String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let enumerator = DeviceEnumerator::new().map_err(|e| {
+    let enumerator = DeviceEnumerator::new().inspect_err(|e| {
         fmt_tx.send(Err(e.to_string())).ok();
-        e
     })?;
 
     let device = enumerator
         .get_default_device(&device_direction)
-        .map_err(|e| {
+        .inspect_err(|e| {
             fmt_tx.send(Err(e.to_string())).ok();
-            e
         })?;
 
-    let mut audio_client = device.get_iaudioclient().map_err(|e| {
+    let mut audio_client = device.get_iaudioclient().inspect_err(|e| {
         fmt_tx.send(Err(e.to_string())).ok();
-        e
     })?;
 
-    let mix_format = audio_client.get_mixformat().map_err(|e| {
+    let mix_format = audio_client.get_mixformat().inspect_err(|e| {
         fmt_tx.send(Err(e.to_string())).ok();
-        e
     })?;
 
     let sample_rate = mix_format.get_samplespersec();
@@ -122,19 +118,16 @@ fn run_capture(
 
     audio_client
         .initialize_client(&mix_format, &capture_direction, &mode)
-        .map_err(|e| {
+        .inspect_err(|e| {
             fmt_tx.send(Err(e.to_string())).ok();
-            e
         })?;
 
-    let event = audio_client.set_get_eventhandle().map_err(|e| {
+    let event = audio_client.set_get_eventhandle().inspect_err(|e| {
         fmt_tx.send(Err(e.to_string())).ok();
-        e
     })?;
 
-    let capture_client = audio_client.get_audiocaptureclient().map_err(|e| {
+    let capture_client = audio_client.get_audiocaptureclient().inspect_err(|e| {
         fmt_tx.send(Err(e.to_string())).ok();
-        e
     })?;
 
     // Report format back to main thread

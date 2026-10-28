@@ -55,9 +55,6 @@ impl Modifiers {
     pub fn any_win(&self) -> bool {
         self.l_win || self.r_win
     }
-    pub fn any_active(&self) -> bool {
-        self.any_shift() || self.any_ctrl() || self.any_alt() || self.any_win()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -118,10 +115,10 @@ pub fn start(
             unsafe { let _ = UnhookWindowsHookEx(hook); }
 
             // Clear the sender so the hook callback won't try to use it
-            if let Some(sender_lock) = KEY_SENDER.get() {
-                if let Ok(mut guard) = sender_lock.lock() {
-                    *guard = None;
-                }
+            if let Some(sender_lock) = KEY_SENDER.get()
+                && let Ok(mut guard) = sender_lock.lock()
+            {
+                *guard = None;
             }
         })
         .expect("failed to spawn keyboard thread");
@@ -161,10 +158,10 @@ unsafe extern "system" fn keyboard_hook_proc(
         let is_injected = (kb.flags.0 & LLKHF_INJECTED.0) != 0;
 
         // Update modifier state
-        if let Some(mods_lock) = MODIFIER_STATE.get() {
-            if let Ok(mut mods) = mods_lock.lock() {
-                update_modifier(&mut mods, kb.vkCode, is_up);
-            }
+        if let Some(mods_lock) = MODIFIER_STATE.get()
+            && let Ok(mut mods) = mods_lock.lock()
+        {
+            update_modifier(&mut mods, kb.vkCode, is_up);
         }
 
         // Read current modifier state
@@ -191,12 +188,11 @@ unsafe extern "system" fn keyboard_hook_proc(
         };
 
         // Non-blocking send
-        if let Some(sender_lock) = KEY_SENDER.get() {
-            if let Ok(guard) = sender_lock.lock() {
-                if let Some(ref tx) = *guard {
-                    let _ = tx.try_send(event);
-                }
-            }
+        if let Some(sender_lock) = KEY_SENDER.get()
+            && let Ok(guard) = sender_lock.lock()
+            && let Some(ref tx) = *guard
+        {
+            let _ = tx.try_send(event);
         }
     }
 

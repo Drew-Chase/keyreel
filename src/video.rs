@@ -17,13 +17,11 @@ use windows_capture::window::Window;
 pub struct CaptureFlags {
     pub frame_tx: SyncSender<VideoFrame>,
     pub stop_flag: Arc<AtomicBool>,
-    pub session_epoch: i64,
 }
 
 pub struct Capture {
     frame_tx: SyncSender<VideoFrame>,
     stop_flag: Arc<AtomicBool>,
-    session_epoch: i64,
 }
 
 impl GraphicsCaptureApiHandler for Capture {
@@ -34,7 +32,6 @@ impl GraphicsCaptureApiHandler for Capture {
         Ok(Self {
             frame_tx: ctx.flags.frame_tx,
             stop_flag: ctx.flags.stop_flag,
-            session_epoch: ctx.flags.session_epoch,
         })
     }
 
@@ -52,9 +49,6 @@ impl GraphicsCaptureApiHandler for Capture {
         // TimeSpan.Duration is in 100ns units (system relative time from QPC)
         let timestamp_100ns = timestamp.Duration;
 
-        let width = frame.width();
-        let height = frame.height();
-
         let frame_buffer = frame.buffer()?;
         let mut tmp = Vec::new();
         let bytes = frame_buffer.as_nopadding_buffer(&mut tmp);
@@ -62,8 +56,6 @@ impl GraphicsCaptureApiHandler for Capture {
         // Send the raw BGRA data to the mux thread
         let video_frame = VideoFrame {
             data: bytes.to_vec(),
-            width,
-            height,
             timestamp_100ns,
         };
 
@@ -81,7 +73,6 @@ pub fn start_capture(
     no_cursor: bool,
     frame_tx: SyncSender<VideoFrame>,
     stop_flag: Arc<AtomicBool>,
-    session_epoch: i64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cursor = if no_cursor {
         CursorCaptureSettings::WithoutCursor
@@ -92,7 +83,6 @@ pub fn start_capture(
     let flags = CaptureFlags {
         frame_tx,
         stop_flag,
-        session_epoch,
     };
 
     if let Some(title) = window_title {

@@ -26,11 +26,6 @@ pub fn ticks_to_100ns(ticks: i64) -> i64 {
     (numerator / frequency() as i128) as i64
 }
 
-/// Converts 100-nanosecond units to milliseconds.
-pub fn hns_to_millis(hns: i64) -> i64 {
-    hns / 10_000
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -53,11 +48,5 @@ mod tests {
         // 1 second worth of ticks should be 10_000_000 hundred-nanosecond units
         let hns = ticks_to_100ns(freq);
         assert_eq!(hns, 10_000_000);
-    }
-
-    #[test]
-    fn hns_to_millis_conversion() {
-        assert_eq!(hns_to_millis(10_000_000), 1000);
-        assert_eq!(hns_to_millis(50_000), 5);
     }
 }

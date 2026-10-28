@@ -59,10 +59,6 @@ impl Session {
         self.running.store(false, Ordering::SeqCst);
     }
 
-    pub fn is_running(&self) -> bool {
-        self.running.load(Ordering::SeqCst)
-    }
-
     /// Returns a clone of the running flag for sharing with other threads.
     pub fn running_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.running)
