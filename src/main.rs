@@ -357,7 +357,7 @@ fn is_elevated() -> bool {
 
         let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
         let mut ret_len: u32 = 0;
-        let size = std::mem::size_of::<TOKEN_ELEVATION>() as u32;
+        let size = size_of::<TOKEN_ELEVATION>() as u32;
         let ok = GetTokenInformation(
             token,
             TokenElevation,
