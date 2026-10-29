@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod audio;
 mod clock;
 mod keyboard;
@@ -138,7 +140,6 @@ fn main() {
     println!("  Subtitles: {}", srt.display());
     println!("  Key log:   {}", jsonl.display());
 
-    output::info("Recording has completed!");
 }
 
 fn start_recording(
