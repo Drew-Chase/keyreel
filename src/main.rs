@@ -23,15 +23,14 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, PeekMessageW, MSG, PM_REMOVE, WM_HOTKEY,
 };
+use windows_capture::graphics_capture_picker::{GraphicsCapturePicker, PickedGraphicsCaptureItem};
 use windows_sys::Win32::System::Console::{
     SetConsoleCtrlHandler, CTRL_CLOSE_EVENT, CTRL_C_EVENT,
 };
 
-const HOTKEY_TOGGLE: i32 = 1;
-const HOTKEY_QUIT: i32 = 2;
+const HOTKEY_STOP: i32 = 1;
 
 /// Global stop flag set by the console control handler.
-/// Shared with all worker threads via Arc clones.
 static CTRL_STOP: AtomicBool = AtomicBool::new(false);
 
 /// Active recording state, bundled for clean start/stop.
@@ -50,105 +49,106 @@ struct Recording {
 }
 
 fn main() {
-    let args = Args::parse();
-
     // Register console close / Ctrl+C handler
     unsafe {
         SetConsoleCtrlHandler(Some(console_ctrl_handler), 1);
     }
 
-    // Parse and register global hotkeys
-    let rec_hotkey = args.parsed_rec_hotkey();
-    let quit_hotkey = args.parsed_quit_hotkey();
-    unsafe {
-        RegisterHotKey(None, HOTKEY_TOGGLE, rec_hotkey.0, rec_hotkey.1).unwrap();
-        RegisterHotKey(None, HOTKEY_QUIT, quit_hotkey.0, quit_hotkey.1).unwrap();
-    }
-
     // Check privilege level
     if !is_elevated() {
-        output::warn("Not running as administrator -- keystrokes from elevated processes won't be captured.");
+        output::warn(
+            "Not running as administrator -- keystrokes from elevated processes won't be captured.",
+        );
+    }
+
+    // Show the system capture picker
+    output::info("Select a window or display to record...");
+    let picked_item = match GraphicsCapturePicker::pick_item() {
+        Ok(Some(item)) => item,
+        Ok(None) => {
+            output::info("No capture target selected. Exiting.");
+            wait_for_enter();
+            return;
+        }
+        Err(e) => {
+            output::error(format!("Capture picker failed: {e}"));
+            wait_for_enter();
+            return;
+        }
+    };
+
+    // Start recording
+    let mut recording = match start_recording(picked_item) {
+        Ok(rec) => rec,
+        Err(e) => {
+            output::error(format!("Failed to start recording: {e}"));
+            wait_for_enter();
+            return;
+        }
+    };
+
+    // Register stop hotkey (Ctrl+Alt+Shift+Q)
+    unsafe {
+        RegisterHotKey(None, HOTKEY_STOP, MOD_CONTROL | MOD_ALT | MOD_SHIFT, 'Q' as u32).unwrap();
     }
 
     output::info(format!(
-        "KeyReel ready. Press {} to start/stop recording, {} to quit.",
-        args.rec_hotkey, args.quit_hotkey
+        "[REC] {} (press Ctrl+Alt+Shift+Q to stop)",
+        recording.session.name()
     ));
-
-    let mut recording: Option<Recording> = None;
 
     // Message loop
     let mut msg = MSG::default();
     loop {
-        // Check Ctrl+C / console close
         if CTRL_STOP.load(Ordering::SeqCst) {
-            if let Some(rec) = recording.take() {
-                stop_recording(rec);
-            }
             break;
         }
 
-        // Drain key events if recording
-        if let Some(ref mut rec) = recording {
-            drain_key_events(rec);
-        }
+        drain_key_events(&mut recording);
 
-        // Non-blocking peek so we can keep draining key events between messages.
         let has_msg = unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) };
         if !has_msg.as_bool() {
-            // Brief blocking wait for next message
             let ret = unsafe { GetMessageW(&mut msg, None, 0, 0) };
             if ret.0 <= 0 {
-                if let Some(rec) = recording.take() {
-                    stop_recording(rec);
-                }
                 break;
             }
         }
 
         if msg.message == WM_HOTKEY {
-            let id = msg.wParam.0 as i32;
-            match id {
-                HOTKEY_TOGGLE => {
-                    if let Some(rec) = recording.take() {
-                        stop_recording(rec);
-                    } else {
-                        match start_recording(&args) {
-                            Ok(rec) => recording = Some(rec),
-                            Err(e) => output::error(format!("Failed to start recording: {e}")),
-                        }
-                    }
-                }
-                HOTKEY_QUIT => {
-                    if let Some(rec) = recording.take() {
-                        stop_recording(rec);
-                    }
-                    break;
-                }
-                _ => {}
-            }
+            break;
         }
 
         unsafe { DispatchMessageW(&msg) };
     }
 
-    // Unregister hotkeys
+    // Save file paths before stop_recording takes ownership
+    let mp4 = recording.session.mp4_path();
+    let srt = recording.session.srt_path();
+    let jsonl = recording.session.jsonl_path();
+
+    stop_recording(recording);
+
     unsafe {
-        let _ = UnregisterHotKey(None, HOTKEY_TOGGLE);
-        let _ = UnregisterHotKey(None, HOTKEY_QUIT);
+        let _ = UnregisterHotKey(None, HOTKEY_STOP);
     }
 
-    output::info("KeyReel exited.");
+    output::info("Recording saved:");
+    output::info(format!("  Video:     {}", mp4.display()));
+    output::info(format!("  Subtitles: {}", srt.display()));
+    output::info(format!("  Key log:   {}", jsonl.display()));
+
+    wait_for_enter();
 }
 
-fn start_recording(args: &Args) -> Result<Recording, Box<dyn std::error::Error>> {
-    // Check available disk space
+fn start_recording(
+    item: PickedGraphicsCaptureItem,
+) -> Result<Recording, Box<dyn std::error::Error>> {
     check_disk_space();
 
     let session = Session::new()?;
     let stop_flag = session.running_flag();
     let keylog = KeylogWriter::new(&session.jsonl_path())?;
-    let subs = SubtitleWriter::new(&session.srt_path(), session.epoch(), args.only_exe.clone())?;
+    let subs = SubtitleWriter::new(&session.srt_path(), session.epoch(), None)?;
 
     // Keyboard capture
     let (key_tx, key_rx) = mpsc::sync_channel::<keyboard::KeyEvent>(1024);
@@ -179,13 +179,11 @@ fn start_recording(args: &Args) -> Result<Recording, Box<dyn std::error::Error>>
     // Video -> Mux channel
     let (frame_tx, frame_rx) = mpsc::sync_channel::<VideoFrame>(4);
 
-    // Mux thread config
+    // Mux thread config (resolution determined from first captured frame)
     let mux_config = MuxConfig {
         output_path: session.mp4_path(),
-        width: 1920,
-        height: 1080,
         fps: 30,
-        video_bitrate: 3_000_000,
+        video_bitrate: 8_000_000,
         loopback_format,
         mic_format,
     };
@@ -211,26 +209,33 @@ fn start_recording(args: &Args) -> Result<Recording, Box<dyn std::error::Error>>
         })
         .expect("failed to spawn mux thread");
 
-    // Start video capture thread
+    // Start video capture thread.
+    // PickedGraphicsCaptureItem contains an HWND (raw pointer) that isn't Send,
+    // but we're transferring sole ownership to the capture thread — safe to move.
     let video_stop = Arc::clone(&stop_flag);
-    let window_title = args.window.clone();
-    let no_cursor = args.no_cursor;
-    let video_handle = std::thread::Builder::new()
-        .name("video".into())
-        .spawn(move || {
-            if let Err(e) =
-                video::start_capture(window_title.as_deref(), no_cursor, frame_tx, video_stop)
-            {
+    let video_handle = {
+        struct SendFn(Box<dyn FnOnce() + 'static>);
+        // SAFETY: The closure only captures PickedGraphicsCaptureItem (whose HWND
+        // is an opaque handle safe to use from any single thread), SyncSender,
+        // and Arc — all of which we transfer sole ownership of.
+        unsafe impl Send for SendFn {}
+        impl SendFn {
+            fn call(self) { (self.0)(); }
+        }
+
+        let f = SendFn(Box::new(move || {
+            if let Err(e) = video::start_capture(item, frame_tx, video_stop) {
                 eprintln!("Video capture error: {e}");
             }
-        })
-        .expect("failed to spawn video thread");
+        }));
+
+        std::thread::Builder::new()
+            .name("video".into())
+            .spawn(move || f.call())
+            .expect("failed to spawn video thread")
+    };
 
     session.start();
-    output::info(format!(
-        "[REC] {} (all keystrokes and microphone are being recorded)",
-        session.name()
-    ));
 
     Ok(Recording {
         session,
@@ -296,17 +301,21 @@ unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> i32 {
     match ctrl_type {
         x if x == CTRL_C_EVENT || x == CTRL_CLOSE_EVENT => {
             CTRL_STOP.store(true, Ordering::SeqCst);
-            1 // TRUE
+            1
         }
-        _ => 0, // FALSE
+        _ => 0,
     }
+}
+
+fn wait_for_enter() {
+    output::info("Press Enter to exit...");
+    let _ = std::io::stdin().read_line(&mut String::new());
 }
 
 // ---------------------------------------------------------------------------
 // Disk space check
 // ---------------------------------------------------------------------------
 
-/// Warns if the output directory has less than 1 GB free.
 fn check_disk_space() {
     let exe_dir = match std::env::current_exe() {
         Ok(p) => match p.parent() {
@@ -335,7 +344,7 @@ fn check_disk_space() {
     if ok.is_ok() && free_bytes < 1_073_741_824 {
         let mb = free_bytes / (1024 * 1024);
         output::warn(format!(
-            "Low disk space: only {mb} MB free. Recording may fail or be truncated."
+            "Low disk space: only {mb} MB free. Recording may fail or be truncated.",
         ));
     }
 }
@@ -344,9 +353,10 @@ fn check_disk_space() {
 // Privilege detection
 // ---------------------------------------------------------------------------
 
-/// Returns true if the current process is running elevated (admin).
 fn is_elevated() -> bool {
-    use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+    use windows::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     unsafe {
@@ -370,99 +380,4 @@ fn is_elevated() -> bool {
 
         ok.is_ok() && elevation.TokenIsElevated != 0
     }
-}
-
-// ---------------------------------------------------------------------------
-// CLI parsing (clap)
-// ---------------------------------------------------------------------------
-
-use clap::Parser;
-
-/// Portable Windows screen recorder with keystroke logging.
-///
-/// Records screen, system audio, and microphone into an MP4 file,
-/// and logs every keystroke to an SRT subtitle file and a JSONL raw log.
-/// All output files are written next to the executable.
-#[derive(Parser)]
-#[command(name = "KeyReel", version, after_help = "\
-HOTKEY FORMAT:
-    Modifier+...+Key  (e.g. Ctrl+Alt+Shift+R, Ctrl+F12)
-    Modifiers: Ctrl, Alt, Shift
-    Keys: A-Z, 0-9, F1-F24
-
-OUTPUT FILES:
-    session_<timestamp>.mp4    Video + audio recording
-    session_<timestamp>.srt    Keystroke subtitles
-    session_<timestamp>.jsonl  Raw keystroke log (one JSON object per line)
-
-EXAMPLES:
-    key_reel.exe
-    key_reel.exe --window \"DOSBox\" --only-exe dosbox.exe
-    key_reel.exe --rec-hotkey Ctrl+F9 --quit-hotkey Ctrl+F10")]
-pub struct Args {
-    /// Capture a specific window (title substring match). Default: primary monitor.
-    #[arg(long)]
-    pub window: Option<String>,
-
-    /// Hide the cursor in the recording.
-    #[arg(long)]
-    pub no_cursor: bool,
-
-    /// Filter subtitles to only show keys when this executable is in the foreground (e.g. dosbox.exe).
-    #[arg(long)]
-    pub only_exe: Option<String>,
-
-    /// Hotkey to toggle recording.
-    #[arg(long, default_value = "Ctrl+Alt+Shift+R")]
-    pub rec_hotkey: String,
-
-    /// Hotkey to quit.
-    #[arg(long, default_value = "Ctrl+Alt+Shift+Q")]
-    pub quit_hotkey: String,
-}
-
-impl Args {
-    /// Parse the rec_hotkey string into (modifiers, vk).
-    pub fn parsed_rec_hotkey(&self) -> (windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS, u32) {
-        parse_hotkey_combo(&self.rec_hotkey)
-            .unwrap_or((MOD_CONTROL | MOD_ALT | MOD_SHIFT, 'R' as u32))
-    }
-
-    /// Parse the quit_hotkey string into (modifiers, vk).
-    pub fn parsed_quit_hotkey(&self) -> (windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS, u32) {
-        parse_hotkey_combo(&self.quit_hotkey)
-            .unwrap_or((MOD_CONTROL | MOD_ALT | MOD_SHIFT, 'Q' as u32))
-    }
-}
-
-/// Parses a hotkey combo string like "Ctrl+Alt+Shift+R" into (modifiers, vk).
-fn parse_hotkey_combo(
-    s: &str,
-) -> Option<(windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS, u32)> {
-    use windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS;
-
-    let mut mods = HOT_KEY_MODIFIERS(0);
-    let mut vk: Option<u32> = None;
-
-    for part in s.split('+') {
-        let part = part.trim();
-        match part.to_ascii_lowercase().as_str() {
-            "ctrl" | "control" => mods |= MOD_CONTROL,
-            "alt" => mods |= MOD_ALT,
-            "shift" => mods |= MOD_SHIFT,
-            _ => {
-                if part.len() == 1 {
-                    vk = Some(part.to_ascii_uppercase().as_bytes()[0] as u32);
-                } else if let Some(stripped) =
-                    part.strip_prefix('F').or_else(|| part.strip_prefix('f'))
-                    && let Ok(n) = stripped.parse::<u32>()
-                    && (1..=24).contains(&n)
-                {
-                    vk = Some(0x70 + n - 1);
-                }
-            }
-        }
-    }
-
-    vk.map(|k| (mods, k))
 }

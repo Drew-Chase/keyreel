@@ -9,32 +9,18 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 /// A video frame received from the capture thread.
 pub struct VideoFrame {
     pub data: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
     pub timestamp_100ns: i64,
 }
 
 /// Configuration for the mux thread.
 pub struct MuxConfig {
     pub output_path: std::path::PathBuf,
-    pub width: u32,
-    pub height: u32,
     pub fps: u32,
     pub video_bitrate: u32,
     pub loopback_format: Option<AudioFormat>,
     pub mic_format: Option<AudioFormat>,
-}
-
-impl Default for MuxConfig {
-    fn default() -> Self {
-        Self {
-            output_path: std::path::PathBuf::new(),
-            width: 1920,
-            height: 1080,
-            fps: 30,
-            video_bitrate: 3_000_000,
-            loopback_format: None,
-            mic_format: None,
-        }
-    }
 }
 
 /// Packs two u32 values into one u64 (emulates MFSetAttributeSize / MFSetAttributeRatio).
@@ -50,7 +36,8 @@ struct StreamIndices {
 }
 
 /// Sets up the IMFSinkWriter with video and optional audio streams.
-fn create_sink_writer(config: &MuxConfig) -> windows::core::Result<(IMFSinkWriter, StreamIndices)> {
+/// Width/height come from the first captured frame so they always match.
+fn create_sink_writer(config: &MuxConfig, width: u32, height: u32) -> windows::core::Result<(IMFSinkWriter, StreamIndices)> {
     let mut attrs: Option<IMFAttributes> = None;
     unsafe { MFCreateAttributes(&mut attrs, 2)? };
     let attrs = attrs.unwrap();
@@ -74,7 +61,7 @@ fn create_sink_writer(config: &MuxConfig) -> windows::core::Result<(IMFSinkWrite
         out_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
         out_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
         out_type.SetUINT32(&MF_MT_AVG_BITRATE, config.video_bitrate)?;
-        out_type.SetUINT64(&MF_MT_FRAME_SIZE, pack_u32_pair(config.width, config.height))?;
+        out_type.SetUINT64(&MF_MT_FRAME_SIZE, pack_u32_pair(width, height))?;
         out_type.SetUINT64(&MF_MT_FRAME_RATE, pack_u32_pair(config.fps, 1))?;
         out_type.SetUINT32(&MF_MT_INTERLACE_MODE, 2)?; // Progressive
     }
@@ -85,7 +72,7 @@ fn create_sink_writer(config: &MuxConfig) -> windows::core::Result<(IMFSinkWrite
     unsafe {
         in_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
         in_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_ARGB32)?;
-        in_type.SetUINT64(&MF_MT_FRAME_SIZE, pack_u32_pair(config.width, config.height))?;
+        in_type.SetUINT64(&MF_MT_FRAME_SIZE, pack_u32_pair(width, height))?;
         in_type.SetUINT64(&MF_MT_FRAME_RATE, pack_u32_pair(config.fps, 1))?;
         in_type.SetUINT32(&MF_MT_INTERLACE_MODE, 2)?;
     }
@@ -231,13 +218,14 @@ fn run_inner(
     mic_rx: &Option<Receiver<AudioPacket>>,
     stop_flag: &Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (writer, indices) = create_sink_writer(config)?;
-
     let frame_duration_100ns = 10_000_000i64 / config.fps as i64;
     let mut next_frame_time: i64 = 0;
     let mut last_frame: Option<Vec<u8>> = None;
     let mut first_frame_offset: Option<i64> = None;
     let recv_timeout = std::time::Duration::from_millis(1000 / config.fps as u64);
+
+    // Sink writer is created lazily on the first frame so we know the real resolution.
+    let mut writer_state: Option<(IMFSinkWriter, StreamIndices)> = None;
 
     // Per-stream last timestamp for monotonicity check
     let mut last_loopback_ts: i64 = -1;
@@ -249,19 +237,21 @@ fn run_inner(
         }
 
         // --- Drain audio channels (non-blocking) ---
-        if let (Some(rx), Some(idx)) = (loopback_rx, indices.loopback) {
-            while let Ok(pkt) = rx.try_recv() {
-                if pkt.timestamp_100ns > last_loopback_ts {
-                    let _ = write_sample(&writer, idx, &pkt.data, pkt.timestamp_100ns, pkt.duration_100ns);
-                    last_loopback_ts = pkt.timestamp_100ns;
+        if let Some((ref writer, ref indices)) = writer_state {
+            if let (Some(rx), Some(idx)) = (loopback_rx, indices.loopback) {
+                while let Ok(pkt) = rx.try_recv() {
+                    if pkt.timestamp_100ns > last_loopback_ts {
+                        let _ = write_sample(writer, idx, &pkt.data, pkt.timestamp_100ns, pkt.duration_100ns);
+                        last_loopback_ts = pkt.timestamp_100ns;
+                    }
                 }
             }
-        }
-        if let (Some(rx), Some(idx)) = (mic_rx, indices.mic) {
-            while let Ok(pkt) = rx.try_recv() {
-                if pkt.timestamp_100ns > last_mic_ts {
-                    let _ = write_sample(&writer, idx, &pkt.data, pkt.timestamp_100ns, pkt.duration_100ns);
-                    last_mic_ts = pkt.timestamp_100ns;
+            if let (Some(rx), Some(idx)) = (mic_rx, indices.mic) {
+                while let Ok(pkt) = rx.try_recv() {
+                    if pkt.timestamp_100ns > last_mic_ts {
+                        let _ = write_sample(writer, idx, &pkt.data, pkt.timestamp_100ns, pkt.duration_100ns);
+                        last_mic_ts = pkt.timestamp_100ns;
+                    }
                 }
             }
         }
@@ -269,6 +259,14 @@ fn run_inner(
         // --- Video frame with timeout for frame duplication ---
         match video_rx.recv_timeout(recv_timeout) {
             Ok(frame) => {
+                // Lazily create the sink writer using the first frame's actual dimensions
+                if writer_state.is_none() {
+                    let (w, h) = (frame.width, frame.height);
+                    eprintln!("mux: first frame received, resolution {w}x{h}");
+                    writer_state = Some(create_sink_writer(config, w, h)?);
+                }
+                let (ref writer, ref indices) = *writer_state.as_ref().unwrap();
+
                 let ts = if let Some(offset) = first_frame_offset {
                     frame.timestamp_100ns - offset
                 } else {
@@ -280,7 +278,7 @@ fn run_inner(
                 if let Some(ref prev_data) = last_frame {
                     while next_frame_time + frame_duration_100ns <= ts {
                         let _ = write_sample(
-                            &writer,
+                            writer,
                             indices.video,
                             prev_data,
                             next_frame_time,
@@ -292,7 +290,7 @@ fn run_inner(
 
                 let write_ts = next_frame_time.max(ts);
                 write_sample(
-                    &writer,
+                    writer,
                     indices.video,
                     &frame.data,
                     write_ts,
@@ -302,12 +300,11 @@ fn run_inner(
                 last_frame = Some(frame.data);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if let Some(ref prev_data) = last_frame {
-                    let data_copy = prev_data.clone();
+                if let (Some(prev_data), Some((writer, indices))) = (&last_frame, &writer_state) {
                     let _ = write_sample(
-                        &writer,
+                        writer,
                         indices.video,
-                        &data_copy,
+                        prev_data,
                         next_frame_time,
                         frame_duration_100ns,
                     );
@@ -320,24 +317,26 @@ fn run_inner(
         }
     }
 
-    // Drain any remaining audio
-    if let (Some(rx), Some(idx)) = (loopback_rx, indices.loopback) {
-        while let Ok(pkt) = rx.try_recv() {
-            if pkt.timestamp_100ns > last_loopback_ts {
-                let _ = write_sample(&writer, idx, &pkt.data, pkt.timestamp_100ns, pkt.duration_100ns);
-                last_loopback_ts = pkt.timestamp_100ns;
+    // Drain any remaining audio and finalize
+    if let Some((ref writer, ref indices)) = writer_state {
+        if let (Some(rx), Some(idx)) = (loopback_rx, indices.loopback) {
+            while let Ok(pkt) = rx.try_recv() {
+                if pkt.timestamp_100ns > last_loopback_ts {
+                    let _ = write_sample(writer, idx, &pkt.data, pkt.timestamp_100ns, pkt.duration_100ns);
+                    last_loopback_ts = pkt.timestamp_100ns;
+                }
             }
         }
-    }
-    if let (Some(rx), Some(idx)) = (mic_rx, indices.mic) {
-        while let Ok(pkt) = rx.try_recv() {
-            if pkt.timestamp_100ns > last_mic_ts {
-                let _ = write_sample(&writer, idx, &pkt.data, pkt.timestamp_100ns, pkt.duration_100ns);
-                last_mic_ts = pkt.timestamp_100ns;
+        if let (Some(rx), Some(idx)) = (mic_rx, indices.mic) {
+            while let Ok(pkt) = rx.try_recv() {
+                if pkt.timestamp_100ns > last_mic_ts {
+                    let _ = write_sample(writer, idx, &pkt.data, pkt.timestamp_100ns, pkt.duration_100ns);
+                    last_mic_ts = pkt.timestamp_100ns;
+                }
             }
         }
+        unsafe { writer.Finalize()? };
     }
 
-    unsafe { writer.Finalize()? };
     Ok(())
 }
