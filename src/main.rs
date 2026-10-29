@@ -12,21 +12,19 @@ mod video;
 use keylog::KeylogWriter;
 use mux::{MuxConfig, VideoFrame};
 use session::Session;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::thread::JoinHandle;
 use subtitles::SubtitleWriter;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOD_ALT, MOD_CONTROL, MOD_SHIFT, RegisterHotKey, UnregisterHotKey,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, PeekMessageW, MSG, PM_REMOVE, WM_HOTKEY,
+    DispatchMessageW, GetMessageW, MSG, PM_REMOVE, PeekMessageW, WM_HOTKEY,
 };
 use windows_capture::graphics_capture_picker::{GraphicsCapturePicker, PickedGraphicsCaptureItem};
-use windows_sys::Win32::System::Console::{
-    SetConsoleCtrlHandler, CTRL_CLOSE_EVENT, CTRL_C_EVENT,
-};
+use windows_sys::Win32::System::Console::{CTRL_C_EVENT, CTRL_CLOSE_EVENT, SetConsoleCtrlHandler};
 
 const HOTKEY_STOP: i32 = 1;
 
@@ -67,12 +65,10 @@ fn main() {
         Ok(Some(item)) => item,
         Ok(None) => {
             output::info("No capture target selected. Exiting.");
-            wait_for_enter();
             return;
         }
         Err(e) => {
             output::error(format!("Capture picker failed: {e}"));
-            wait_for_enter();
             return;
         }
     };
@@ -82,14 +78,19 @@ fn main() {
         Ok(rec) => rec,
         Err(e) => {
             output::error(format!("Failed to start recording: {e}"));
-            wait_for_enter();
             return;
         }
     };
 
     // Register stop hotkey (Ctrl+Alt+Shift+Q)
     unsafe {
-        RegisterHotKey(None, HOTKEY_STOP, MOD_CONTROL | MOD_ALT | MOD_SHIFT, 'Q' as u32).unwrap();
+        RegisterHotKey(
+            None,
+            HOTKEY_STOP,
+            MOD_CONTROL | MOD_ALT | MOD_SHIFT,
+            'Q' as u32,
+        )
+        .unwrap();
     }
 
     output::info(format!(
@@ -132,12 +133,12 @@ fn main() {
         let _ = UnregisterHotKey(None, HOTKEY_STOP);
     }
 
-    output::info("Recording saved:");
-    output::info(format!("  Video:     {}", mp4.display()));
-    output::info(format!("  Subtitles: {}", srt.display()));
-    output::info(format!("  Key log:   {}", jsonl.display()));
+    println!("Recording saved:");
+    println!("  Video:     {}", mp4.display());
+    println!("  Subtitles: {}", srt.display());
+    println!("  Key log:   {}", jsonl.display());
 
-    wait_for_enter();
+    output::info("Recording has completed!");
 }
 
 fn start_recording(
@@ -220,7 +221,9 @@ fn start_recording(
         // and Arc — all of which we transfer sole ownership of.
         unsafe impl Send for SendFn {}
         impl SendFn {
-            fn call(self) { (self.0)(); }
+            fn call(self) {
+                (self.0)();
+            }
         }
 
         let f = SendFn(Box::new(move || {
@@ -304,11 +307,6 @@ unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> i32 {
     }
 }
 
-fn wait_for_enter() {
-    output::info("Press Enter to exit...");
-    let _ = std::io::stdin().read_line(&mut String::new());
-}
-
 // ---------------------------------------------------------------------------
 // Disk space check
 // ---------------------------------------------------------------------------
@@ -352,7 +350,7 @@ fn check_disk_space() {
 
 fn is_elevated() -> bool {
     use windows::Win32::Security::{
-        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
     };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
