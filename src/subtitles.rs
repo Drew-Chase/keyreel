@@ -12,7 +12,7 @@ const GROUP_GAP_100NS: i64 = 300 * 10_000; // 300 ms
 const GROUP_MAX_CHARS: usize = 40;
 
 /// Maximum cue duration (in 100ns units) if no next cue follows.
-const MAX_CUE_DURATION_100NS: i64 = 1_500 * 10_000; // 1.5 s
+const MAX_CUE_DURATION_100NS: i64 = 3_000 * 10_000; // 3 s
 
 pub struct SubtitleWriter {
     file: BufWriter<File>,

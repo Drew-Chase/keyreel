@@ -219,9 +219,8 @@ fn run_inner(
     stop_flag: &Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let frame_duration_100ns = 10_000_000i64 / config.fps as i64;
-    let mut next_frame_time: i64 = 0;
+    let mut next_frame_time: Option<i64> = None;
     let mut last_frame: Option<Vec<u8>> = None;
-    let mut first_frame_offset: Option<i64> = None;
     let recv_timeout = std::time::Duration::from_millis(1000 / config.fps as u64);
 
     // Sink writer is created lazily on the first frame so we know the real resolution.
@@ -267,28 +266,25 @@ fn run_inner(
                 }
                 let (ref writer, ref indices) = *writer_state.as_ref().unwrap();
 
-                let ts = if let Some(offset) = first_frame_offset {
-                    frame.timestamp_100ns - offset
-                } else {
-                    first_frame_offset = Some(frame.timestamp_100ns);
-                    0
-                };
+                // Timestamps are QPC-based relative to session epoch (same as subtitles).
+                let ts = frame.timestamp_100ns;
+                let nft = next_frame_time.get_or_insert(ts);
 
                 // Duplicate last frame to catch up
                 if let Some(ref prev_data) = last_frame {
-                    while next_frame_time + frame_duration_100ns <= ts {
+                    while *nft + frame_duration_100ns <= ts {
                         let _ = write_sample(
                             writer,
                             indices.video,
                             prev_data,
-                            next_frame_time,
+                            *nft,
                             frame_duration_100ns,
                         );
-                        next_frame_time += frame_duration_100ns;
+                        *nft += frame_duration_100ns;
                     }
                 }
 
-                let write_ts = next_frame_time.max(ts);
+                let write_ts = (*nft).max(ts);
                 write_sample(
                     writer,
                     indices.video,
@@ -296,19 +292,21 @@ fn run_inner(
                     write_ts,
                     frame_duration_100ns,
                 )?;
-                next_frame_time = write_ts + frame_duration_100ns;
+                *nft = write_ts + frame_duration_100ns;
                 last_frame = Some(frame.data);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if let (Some(prev_data), Some((writer, indices))) = (&last_frame, &writer_state) {
+                if let (Some(prev_data), Some((writer, indices)), Some(nft)) =
+                    (&last_frame, &writer_state, &mut next_frame_time)
+                {
                     let _ = write_sample(
                         writer,
                         indices.video,
                         prev_data,
-                        next_frame_time,
+                        *nft,
                         frame_duration_100ns,
                     );
-                    next_frame_time += frame_duration_100ns;
+                    *nft += frame_duration_100ns;
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {

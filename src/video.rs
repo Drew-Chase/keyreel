@@ -15,11 +15,13 @@ use windows_capture::settings::{
 pub struct CaptureFlags {
     pub frame_tx: SyncSender<VideoFrame>,
     pub stop_flag: Arc<AtomicBool>,
+    pub session_epoch: i64,
 }
 
 pub struct Capture {
     frame_tx: SyncSender<VideoFrame>,
     stop_flag: Arc<AtomicBool>,
+    session_epoch: i64,
 }
 
 impl GraphicsCaptureApiHandler for Capture {
@@ -30,6 +32,7 @@ impl GraphicsCaptureApiHandler for Capture {
         Ok(Self {
             frame_tx: ctx.flags.frame_tx,
             stop_flag: ctx.flags.stop_flag,
+            session_epoch: ctx.flags.session_epoch,
         })
     }
 
@@ -43,8 +46,11 @@ impl GraphicsCaptureApiHandler for Capture {
             return Ok(());
         }
 
-        let timestamp = frame.timestamp()?;
-        let timestamp_100ns = timestamp.Duration;
+        // Use QPC-based timestamps relative to session epoch so video and subtitles
+        // share the same time base (subtitles also use QPC relative to session epoch).
+        let timestamp_100ns = crate::clock::ticks_to_100ns(
+            crate::clock::now_ticks() - self.session_epoch,
+        );
 
         let width = frame.width();
         let height = frame.height();
@@ -73,8 +79,9 @@ pub fn start_capture(
     item: PickedGraphicsCaptureItem,
     frame_tx: SyncSender<VideoFrame>,
     stop_flag: Arc<AtomicBool>,
+    session_epoch: i64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let flags = CaptureFlags { frame_tx, stop_flag };
+    let flags = CaptureFlags { frame_tx, stop_flag, session_epoch };
 
     let settings = Settings::new(
         item,

@@ -214,6 +214,7 @@ fn start_recording(
     // PickedGraphicsCaptureItem contains an HWND (raw pointer) that isn't Send,
     // but we're transferring sole ownership to the capture thread — safe to move.
     let video_stop = Arc::clone(&stop_flag);
+    let video_epoch = session.epoch();
     let video_handle = {
         struct SendFn(Box<dyn FnOnce() + 'static>);
         // SAFETY: The closure only captures PickedGraphicsCaptureItem (whose HWND
@@ -227,7 +228,7 @@ fn start_recording(
         }
 
         let f = SendFn(Box::new(move || {
-            if let Err(e) = video::start_capture(item, frame_tx, video_stop) {
+            if let Err(e) = video::start_capture(item, frame_tx, video_stop, video_epoch) {
                 output::error(format!("Video capture error: {e}"));
             }
         }));
