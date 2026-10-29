@@ -160,8 +160,9 @@ fn start_recording(
     let (loopback_tx, loopback_rx) = mpsc::sync_channel::<audio::AudioPacket>(256);
     let (mic_tx, mic_rx) = mpsc::sync_channel::<audio::AudioPacket>(256);
 
-    let loopback_result = audio::start_loopback(loopback_tx, Arc::clone(&stop_flag));
-    let mic_result = audio::start_mic(mic_tx, Arc::clone(&stop_flag));
+    let epoch = session.epoch();
+    let loopback_result = audio::start_loopback(loopback_tx, Arc::clone(&stop_flag), epoch);
+    let mic_result = audio::start_mic(mic_tx, Arc::clone(&stop_flag), epoch);
 
     let (loopback_handle, loopback_format) = match loopback_result {
         Some((h, f)) => (Some(h), Some(f)),
@@ -188,6 +189,7 @@ fn start_recording(
         video_bitrate: 8_000_000,
         loopback_format,
         mic_format,
+        session_epoch: epoch,
     };
 
     // Only pass rx channels to mux if the corresponding audio thread started

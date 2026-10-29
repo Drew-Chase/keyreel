@@ -387,4 +387,52 @@ mod tests {
 
         std::fs::remove_file(&path).ok();
     }
+
+    #[test]
+    fn test_srt_cue_duration_is_3s() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_3s_duration.srt");
+        let mut w = SubtitleWriter::new(&path, 0, None).unwrap();
+
+        let mods = Modifiers::default();
+        // A single key press at t=1s (QPC ticks)
+        let freq = clock::frequency();
+        let event = make_event(freq, 0x0D, "Enter", mods);
+        w.feed(&event).unwrap();
+        w.finish().unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        // Key at 1.000s, should show until 4.000s (3s duration)
+        assert!(
+            content.contains("00:00:01,000 --> 00:00:04,000"),
+            "Expected 3-second cue duration, got: {content}"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_srt_timestamps_are_session_relative() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("test_session_relative.srt");
+
+        // Session epoch = 2 seconds of QPC ticks
+        let freq = clock::frequency();
+        let epoch = 2 * freq;
+        let mut w = SubtitleWriter::new(&path, epoch, None).unwrap();
+
+        let mods = Modifiers::default();
+        // Key event at 5 seconds (absolute QPC), so 3s relative to epoch
+        let event = make_event(5 * freq, 'x' as u32, "x", mods);
+        w.feed(&event).unwrap();
+        w.finish().unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("00:00:03,000"),
+            "Timestamp should be 3s relative to epoch, got: {content}"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
 }

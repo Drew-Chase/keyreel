@@ -17,7 +17,6 @@ pub struct AudioFormat {
 pub struct AudioPacket {
     pub data: Vec<u8>,
     pub timestamp_100ns: i64,
-    pub duration_100ns: i64,
 }
 
 /// Starts the loopback (system audio) capture thread.
@@ -25,8 +24,9 @@ pub struct AudioPacket {
 pub fn start_loopback(
     audio_tx: SyncSender<AudioPacket>,
     stop_flag: Arc<AtomicBool>,
+    session_epoch: i64,
 ) -> Option<(JoinHandle<()>, AudioFormat)> {
-    start_capture_thread("loopback", Direction::Render, audio_tx, stop_flag)
+    start_capture_thread("loopback", Direction::Render, audio_tx, stop_flag, session_epoch)
 }
 
 /// Starts the microphone capture thread.
@@ -34,8 +34,9 @@ pub fn start_loopback(
 pub fn start_mic(
     audio_tx: SyncSender<AudioPacket>,
     stop_flag: Arc<AtomicBool>,
+    session_epoch: i64,
 ) -> Option<(JoinHandle<()>, AudioFormat)> {
-    start_capture_thread("mic", Direction::Capture, audio_tx, stop_flag)
+    start_capture_thread("mic", Direction::Capture, audio_tx, stop_flag, session_epoch)
 }
 
 fn start_capture_thread(
@@ -43,6 +44,7 @@ fn start_capture_thread(
     device_direction: Direction,
     audio_tx: SyncSender<AudioPacket>,
     stop_flag: Arc<AtomicBool>,
+    session_epoch: i64,
 ) -> Option<(JoinHandle<()>, AudioFormat)> {
     // Use a channel to get the format back from the thread (or an error)
     let (fmt_tx, fmt_rx) = mpsc::channel::<Result<AudioFormat, String>>();
@@ -52,7 +54,7 @@ fn start_capture_thread(
         .spawn(move || {
             let _ = wasapi::initialize_mta();
 
-            let result = run_capture(name, device_direction, &audio_tx, &stop_flag, &fmt_tx);
+            let result = run_capture(name, device_direction, &audio_tx, &stop_flag, &fmt_tx, session_epoch);
             if let Err(e) = result {
                 crate::output::error(format!("{name}: capture error: {e}"));
             }
@@ -84,6 +86,7 @@ fn run_capture(
     audio_tx: &SyncSender<AudioPacket>,
     stop_flag: &Arc<AtomicBool>,
     fmt_tx: &mpsc::Sender<Result<AudioFormat, String>>,
+    session_epoch: i64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let enumerator = DeviceEnumerator::new().inspect_err(|e| {
         fmt_tx.send(Err(e.to_string())).ok();
@@ -143,10 +146,10 @@ fn run_capture(
     audio_client.start_stream()?;
 
     let mut buf = vec![0u8; 4096 * block_align as usize];
-    let mut samples_written: u64 = 0;
+    let epoch_100ns = crate::clock::ticks_to_100ns(session_epoch);
 
-    // For loopback silence gap detection
-    let is_loopback = matches!(device_direction, Direction::Render);
+    // Fallback timestamp for packets where WASAPI doesn't report a QPC position.
+    let mut fallback_ts_100ns: i64 = 0;
 
     loop {
         if stop_flag.load(Ordering::Relaxed) {
@@ -179,31 +182,35 @@ fn run_capture(
                     }
 
                     let byte_len = frames_read as usize * block_align as usize;
-
-                    // Calculate timestamp based on samples written so far
-                    let ts_100ns =
-                        (samples_written as i128 * 10_000_000) / sample_rate as i128;
                     let dur_100ns =
-                        (frames_read as i128 * 10_000_000) / sample_rate as i128;
+                        (frames_read as i128 * 10_000_000 / sample_rate as i128) as i64;
 
-                    // For loopback: detect silence gaps and insert silence
-                    if is_loopback && info.flags.silent {
-                        // Insert silence (zero-filled data)
+                    // WASAPI reports the QPC time (in 100ns) at which the first frame
+                    // of this packet was captured — the same clock as video and
+                    // subtitles. Gaps (e.g. loopback delivers nothing during silence)
+                    // and device-clock drift are corrected in the mux.
+                    let ts_100ns = if info.timestamp != 0 {
+                        info.timestamp as i64 - epoch_100ns
+                    } else {
+                        fallback_ts_100ns.max(crate::clock::ticks_to_100ns(
+                            crate::clock::now_ticks() - session_epoch,
+                        ) - dur_100ns)
+                    };
+                    fallback_ts_100ns = ts_100ns + dur_100ns;
+
+                    // SILENT flag: the buffer contents must be treated as silence.
+                    if info.flags.silent {
                         let silence = vec![0u8; byte_len];
                         let _ = audio_tx.try_send(AudioPacket {
                             data: silence,
-                            timestamp_100ns: ts_100ns as i64,
-                            duration_100ns: dur_100ns as i64,
+                            timestamp_100ns: ts_100ns,
                         });
                     } else {
                         let _ = audio_tx.try_send(AudioPacket {
                             data: buf[..byte_len].to_vec(),
-                            timestamp_100ns: ts_100ns as i64,
-                            duration_100ns: dur_100ns as i64,
+                            timestamp_100ns: ts_100ns,
                         });
                     }
-
-                    samples_written += frames_read as u64;
                 }
                 Err(_) => break,
             }

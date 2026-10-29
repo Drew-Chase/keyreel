@@ -11,6 +11,9 @@ use windows_capture::settings::{
     MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
 };
 
+/// Maximum plausible delay between a frame's capture and its delivery to us.
+const MAX_DELIVERY_LAG_100NS: i64 = 100 * 10_000; // 100 ms
+
 /// Flags passed through the capture settings to our handler.
 pub struct CaptureFlags {
     pub frame_tx: SyncSender<VideoFrame>,
@@ -21,7 +24,10 @@ pub struct CaptureFlags {
 pub struct Capture {
     frame_tx: SyncSender<VideoFrame>,
     stop_flag: Arc<AtomicBool>,
-    session_epoch: i64,
+    session_epoch: i64, // raw QPC ticks
+    /// Calibration offset computed on the first frame to map WGC timestamps
+    /// (which use a different epoch than QPC) into QPC-relative 100ns values.
+    wgc_to_qpc_offset: Option<i64>,
 }
 
 impl GraphicsCaptureApiHandler for Capture {
@@ -33,6 +39,7 @@ impl GraphicsCaptureApiHandler for Capture {
             frame_tx: ctx.flags.frame_tx,
             stop_flag: ctx.flags.stop_flag,
             session_epoch: ctx.flags.session_epoch,
+            wgc_to_qpc_offset: None,
         })
     }
 
@@ -46,11 +53,23 @@ impl GraphicsCaptureApiHandler for Capture {
             return Ok(());
         }
 
-        // Use QPC-based timestamps relative to session epoch so video and subtitles
-        // share the same time base (subtitles also use QPC relative to session epoch).
-        let timestamp_100ns = crate::clock::ticks_to_100ns(
-            crate::clock::now_ticks() - self.session_epoch,
-        );
+        // WGC's SystemRelativeTime uses a different epoch than QPC, so we
+        // calibrate on the first frame: compute the offset between QPC-relative
+        // session time and the WGC timestamp, then apply it to all frames.
+        // This anchors WGC to the same QPC clock that audio and subtitles use,
+        // while preserving WGC's precise inter-frame deltas (no callback jitter).
+        // A capture can't happen after "now", and delivery shouldn't lag by more
+        // than MAX_DELIVERY_LAG; if either is violated the clocks have drifted
+        // apart, so recalibrate rather than let video slide out of sync.
+        let wgc_ts = frame.timestamp()?.Duration;
+        let qpc_now_100ns =
+            crate::clock::ticks_to_100ns(crate::clock::now_ticks() - self.session_epoch);
+
+        let mut timestamp_100ns = wgc_ts + *self.wgc_to_qpc_offset.get_or_insert(qpc_now_100ns - wgc_ts);
+        if timestamp_100ns > qpc_now_100ns || qpc_now_100ns - timestamp_100ns > MAX_DELIVERY_LAG_100NS {
+            self.wgc_to_qpc_offset = Some(qpc_now_100ns - wgc_ts);
+            timestamp_100ns = qpc_now_100ns;
+        }
 
         let width = frame.width();
         let height = frame.height();
