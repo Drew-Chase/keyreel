@@ -54,7 +54,7 @@ fn start_capture_thread(
 
             let result = run_capture(name, device_direction, &audio_tx, &stop_flag, &fmt_tx);
             if let Err(e) = result {
-                eprintln!("{name}: capture error: {e}");
+                crate::output::error(format!("{name}: capture error: {e}"));
             }
 
             wasapi::deinitialize();
@@ -65,7 +65,7 @@ fn start_capture_thread(
     match fmt_rx.recv() {
         Ok(Ok(format)) => Some((handle, format)),
         Ok(Err(e)) => {
-            eprintln!("{name}: device not available: {e}");
+            crate::output::error(format!("{name}: device not available: {e}"));
             // Thread will exit on its own
             let _ = handle.join();
             None

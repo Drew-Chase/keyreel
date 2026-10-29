@@ -146,7 +146,7 @@ fn start_recording(
     check_disk_space();
 
     let session = Session::new()?;
-    let stop_flag = session.running_flag();
+    let stop_flag = Arc::new(AtomicBool::new(false));
     let keylog = KeylogWriter::new(&session.jsonl_path())?;
     let subs = SubtitleWriter::new(&session.srt_path(), session.epoch(), None)?;
 
@@ -225,7 +225,7 @@ fn start_recording(
 
         let f = SendFn(Box::new(move || {
             if let Err(e) = video::start_capture(item, frame_tx, video_stop) {
-                eprintln!("Video capture error: {e}");
+                output::error(format!("Video capture error: {e}"));
             }
         }));
 
@@ -234,8 +234,6 @@ fn start_recording(
             .spawn(move || f.call())
             .expect("failed to spawn video thread")
     };
-
-    session.start();
 
     Ok(Recording {
         session,
@@ -255,7 +253,6 @@ fn start_recording(
 fn stop_recording(mut rec: Recording) {
     // Signal all threads to stop
     rec.stop_flag.store(true, Ordering::SeqCst);
-    rec.session.stop();
 
     // Drain remaining key events
     drain_key_events(&mut rec);

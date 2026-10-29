@@ -1,13 +1,10 @@
 use crate::clock;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 pub struct Session {
     name: String,
     base_path: PathBuf,
     epoch: i64,
-    running: Arc<AtomicBool>,
 }
 
 impl Session {
@@ -27,7 +24,6 @@ impl Session {
             name,
             base_path,
             epoch: clock::now_ticks(),
-            running: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -49,19 +45,6 @@ impl Session {
 
     pub fn jsonl_path(&self) -> PathBuf {
         self.base_path.join(format!("{}.jsonl", self.name))
-    }
-
-    pub fn start(&self) {
-        self.running.store(true, Ordering::SeqCst);
-    }
-
-    pub fn stop(&self) {
-        self.running.store(false, Ordering::SeqCst);
-    }
-
-    /// Returns a clone of the running flag for sharing with other threads.
-    pub fn running_flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.running)
     }
 }
 

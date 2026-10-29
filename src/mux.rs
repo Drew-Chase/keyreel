@@ -192,17 +192,17 @@ pub fn run(
 ) {
     let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
     if hr.is_err() {
-        eprintln!("mux: CoInitializeEx failed: {hr:?}");
+        crate::output::error(format!("mux: CoInitializeEx failed: {hr:?}"));
         return;
     }
     if let Err(e) = unsafe { MFStartup(MF_VERSION, 0) } {
-        eprintln!("mux: MFStartup failed: {e}");
+        crate::output::error(format!("mux: MFStartup failed: {e}"));
         return;
     }
 
     let result = run_inner(&config, &video_rx, &loopback_rx, &mic_rx, &stop_flag);
     if let Err(e) = result {
-        eprintln!("mux: error: {e}");
+        crate::output::error(format!("mux: error: {e}"));
     }
 
     unsafe {
