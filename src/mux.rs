@@ -37,6 +37,12 @@ const VIDEO_LATENESS_MARGIN_100NS: i64 = 150 * 10_000; // 150 ms
 /// Audio timestamp error tolerated before inserting silence / trimming samples.
 const AUDIO_DRIFT_TOLERANCE_100NS: i64 = 20 * 10_000; // 20 ms
 
+/// Shows a warning without blocking the mux thread (a message box would stall
+/// encoding until the user dismisses it).
+fn warn_async(text: String) {
+    std::thread::spawn(move || crate::output::warn(text));
+}
+
 /// Session-relative "now" in 100ns units.
 fn now_100ns(session_epoch: i64) -> i64 {
     crate::clock::ticks_to_100ns(crate::clock::now_ticks() - session_epoch)
@@ -185,6 +191,9 @@ fn pack_u32_pair(high: u32, low: u32) -> u64 {
     ((high as u64) << 32) | (low as u64)
 }
 
+const TRACK_DESKTOP: &str = "Desktop";
+const TRACK_MIC: &str = "Microphone";
+
 /// Stream indices for the sink writer.
 struct StreamIndices {
     video: u32,
@@ -192,9 +201,28 @@ struct StreamIndices {
     mic: Option<u32>,
 }
 
+/// Sink writer setup failure. `track` names the audio track that caused it,
+/// so the caller can retry without that track instead of losing the recording.
+struct SinkError {
+    track: Option<&'static str>,
+    error: windows::core::Error,
+}
+
+impl From<windows::core::Error> for SinkError {
+    fn from(error: windows::core::Error) -> Self {
+        Self { track: None, error }
+    }
+}
+
 /// Sets up the IMFSinkWriter with video and optional audio streams.
 /// Width/height come from the first captured frame so they always match.
-fn create_sink_writer(config: &MuxConfig, width: u32, height: u32) -> windows::core::Result<(IMFSinkWriter, StreamIndices)> {
+fn create_sink_writer(
+    config: &MuxConfig,
+    width: u32,
+    height: u32,
+    loopback_format: Option<&AudioFormat>,
+    mic_format: Option<&AudioFormat>,
+) -> Result<(IMFSinkWriter, StreamIndices), SinkError> {
     let mut attrs: Option<IMFAttributes> = None;
     unsafe { MFCreateAttributes(&mut attrs, 2)? };
     let attrs = attrs.unwrap();
@@ -236,17 +264,13 @@ fn create_sink_writer(config: &MuxConfig, width: u32, height: u32) -> windows::c
     unsafe { writer.SetInputMediaType(video_idx, &in_type, None)? };
 
     // --- Audio streams ---
-    let loopback_idx = if let Some(ref fmt) = config.loopback_format {
-        Some(add_audio_stream(&writer, fmt, "Desktop")?)
-    } else {
-        None
+    let add = |fmt: Option<&AudioFormat>, name: &'static str| -> Result<Option<u32>, SinkError> {
+        fmt.map(|fmt| add_audio_stream(&writer, fmt, name))
+            .transpose()
+            .map_err(|error| SinkError { track: Some(name), error })
     };
-
-    let mic_idx = if let Some(ref fmt) = config.mic_format {
-        Some(add_audio_stream(&writer, fmt, "Microphone")?)
-    } else {
-        None
-    };
+    let loopback_idx = add(loopback_format, TRACK_DESKTOP)?;
+    let mic_idx = add(mic_format, TRACK_MIC)?;
 
     unsafe { writer.BeginWriting()? };
 
@@ -266,12 +290,18 @@ fn add_audio_stream(
     fmt: &AudioFormat,
     name: &str,
 ) -> windows::core::Result<u32> {
-    // Output type: AAC
+    // Output type: AAC. The encoder only accepts 44.1/48 kHz, so other device
+    // rates (e.g. 16 kHz Bluetooth hands-free mics) are resampled by the sink
+    // writer's audio converter.
+    let aac_rate = match fmt.sample_rate {
+        44_100 | 48_000 => fmt.sample_rate,
+        _ => 48_000,
+    };
     let out_type = unsafe { MFCreateMediaType()? };
     unsafe {
         out_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
         out_type.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_AAC)?;
-        out_type.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, fmt.sample_rate)?;
+        out_type.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, aac_rate)?;
         out_type.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, fmt.channels as u32)?;
         out_type.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
         out_type.SetUINT32(&MF_MT_AVG_BITRATE, 192_000)?; // 192 kbps
@@ -432,7 +462,25 @@ fn run_inner(
                 if writer.is_none() {
                     let (w, h) = (frame.width, frame.height);
                     eprintln!("mux: first frame received, resolution {w}x{h}");
-                    let (wr, indices) = create_sink_writer(config, w, h)?;
+                    let (wr, indices) = loop {
+                        let lb_fmt = config.loopback_format.as_ref().filter(|_| loopback.is_some());
+                        let mic_fmt = config.mic_format.as_ref().filter(|_| mic.is_some());
+                        match create_sink_writer(config, w, h, lb_fmt, mic_fmt) {
+                            Ok(created) => break created,
+                            // An audio track the encoder can't take: drop just that
+                            // track and retry, rather than losing the whole recording.
+                            Err(SinkError { track: Some(name), error }) => {
+                                let fmt = if name == TRACK_MIC { mic_fmt } else { lb_fmt }.unwrap();
+                                warn_async(format!(
+                                    "{name} audio format ({} Hz, {} ch, {}-bit) isn't supported -- \
+                                     recording without it.\n\n{error}",
+                                    fmt.sample_rate, fmt.channels, fmt.bits_per_sample,
+                                ));
+                                if name == TRACK_MIC { mic = None } else { loopback = None }
+                            }
+                            Err(SinkError { track: None, error }) => return Err(error.into()),
+                        }
+                    };
                     video = Some(VideoTrack::new(indices.video, config.fps));
                     if let (Some(t), Some(i)) = (loopback.as_mut(), indices.loopback) {
                         t.stream = i;
@@ -740,6 +788,117 @@ mod tests {
         let size = std::fs::metadata(&path).unwrap().len();
         assert!(size > 1000, "MP4 with audio should be larger than 1KB, got {size}");
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Number of streams in an MP4 file.
+    fn count_streams(path: &std::path::Path) -> u32 {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            MFStartup(MF_VERSION, 0).unwrap();
+            let url = HSTRING::from(path.to_string_lossy().as_ref());
+            let reader = MFCreateSourceReaderFromURL(&url, None).unwrap();
+            let mut n = 0;
+            while reader.GetNativeMediaType(n, 0).is_ok() {
+                n += 1;
+            }
+            drop(reader);
+            let _ = MFShutdown();
+            n
+        }
+    }
+
+    /// Records 1 s of video plus audio in the given formats; returns the MP4 path.
+    /// `None` means that device wasn't found (no format, no channel).
+    fn record_with_formats(
+        name: &str,
+        loopback_fmt: Option<AudioFormat>,
+        mic_fmt: Option<AudioFormat>,
+    ) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_file(&path);
+
+        let config = MuxConfig {
+            output_path: path.clone(),
+            fps: 30,
+            video_bitrate: 1_000_000,
+            loopback_format: loopback_fmt.clone(),
+            mic_format: mic_fmt.clone(),
+            session_epoch: crate::clock::now_ticks(),
+        };
+
+        let (frame_tx, frame_rx) = mpsc::sync_channel::<VideoFrame>(32);
+        let frame_dur = 10_000_000i64 / 30;
+        for i in 0..30 {
+            frame_tx.send(fake_frame(320, 240, i * frame_dur)).unwrap();
+        }
+        drop(frame_tx);
+
+        let make_audio = |fmt: &Option<AudioFormat>| {
+            fmt.as_ref().map(|f| {
+                let (tx, rx) = mpsc::sync_channel::<AudioPacket>(64);
+                let chunk = 200_000i64;
+                for i in 0..50 {
+                    tx.send(fake_audio(i * chunk, chunk, f.block_align, f.sample_rate)).unwrap();
+                }
+                rx
+            })
+        };
+        let loopback_rx = make_audio(&loopback_fmt);
+        let mic_rx = make_audio(&mic_fmt);
+
+        run(config, frame_rx, loopback_rx, mic_rx, Arc::new(AtomicBool::new(false)));
+        path
+    }
+
+    #[test]
+    fn test_mux_no_mic_records_video_and_desktop() {
+        let path = record_with_formats("test_mux_no_mic.mp4", Some(audio_format_48k_stereo_f32()), None);
+        assert!(path.exists(), "MP4 should exist without a microphone");
+        assert_eq!(count_streams(&path), 2, "expected video + desktop audio");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_mux_no_audio_devices_records_video_only() {
+        let path = record_with_formats("test_mux_no_audio.mp4", None, None);
+        assert!(path.exists(), "MP4 should exist without any audio device");
+        assert_eq!(count_streams(&path), 1, "expected video only");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Bluetooth headset mics (hands-free profile) are 16 kHz mono, which AAC
+    /// can't encode directly; it must be resampled rather than failing the mux.
+    #[test]
+    fn test_mux_bluetooth_mic_16k_mono() {
+        let mic = AudioFormat { sample_rate: 16_000, channels: 1, bits_per_sample: 32, block_align: 4 };
+        let path = record_with_formats("test_mux_bt_mic.mp4", Some(audio_format_48k_stereo_f32()), Some(mic));
+        assert!(path.exists(), "MP4 should exist with a 16 kHz mic");
+        assert_eq!(count_streams(&path), 3, "expected video + desktop + mic");
+        // Resampling must not change the track's length (1 s of input).
+        for (stream, (_, end)) in read_stream_extents(&path, 3) {
+            assert!((end - 10_000_000).abs() <= 60 * 10_000, "stream {stream} ends at {end}");
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Multichannel output devices (e.g. 7.1 speakers) feed loopback 8 channels.
+    #[test]
+    fn test_mux_loopback_7_1() {
+        let lb = AudioFormat { sample_rate: 48_000, channels: 8, bits_per_sample: 32, block_align: 32 };
+        let path = record_with_formats("test_mux_7_1.mp4", Some(lb), None);
+        assert!(path.exists(), "MP4 should exist with 7.1 loopback");
+        assert_eq!(count_streams(&path), 2, "expected video + desktop");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A mic format nothing can encode must drop just that track, not the recording.
+    #[test]
+    fn test_mux_unsupported_mic_is_dropped() {
+        let mic = AudioFormat { sample_rate: 48_000, channels: 2, bits_per_sample: 12, block_align: 3 };
+        let path = record_with_formats("test_mux_bad_mic.mp4", Some(audio_format_48k_stereo_f32()), Some(mic));
+        assert!(path.exists(), "MP4 should still be written when the mic format is unusable");
+        assert_eq!(count_streams(&path), 2, "expected video + desktop, mic dropped");
         std::fs::remove_file(&path).ok();
     }
 

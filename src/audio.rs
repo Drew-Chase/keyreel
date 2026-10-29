@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use wasapi::{DeviceEnumerator, Direction, StreamMode};
+use wasapi::{AudioCaptureClient, AudioClient, DeviceEnumerator, Direction, Handle, StreamMode};
 
 /// Audio format info reported back by a capture thread at startup.
 #[derive(Clone, Debug)]
@@ -20,23 +20,25 @@ pub struct AudioPacket {
 }
 
 /// Starts the loopback (system audio) capture thread.
-/// Returns the thread handle and the device's audio format, or None if the device isn't available.
+/// Returns the thread handle and the device's audio format, or the reason the
+/// device isn't available. Shows no UI; the caller decides how to report it.
 pub fn start_loopback(
     audio_tx: SyncSender<AudioPacket>,
     stop_flag: Arc<AtomicBool>,
     session_epoch: i64,
-) -> Option<(JoinHandle<()>, AudioFormat)> {
-    start_capture_thread("loopback", Direction::Render, audio_tx, stop_flag, session_epoch)
+) -> Result<(JoinHandle<()>, AudioFormat), String> {
+    start_capture_thread("Desktop audio", Direction::Render, audio_tx, stop_flag, session_epoch)
 }
 
 /// Starts the microphone capture thread.
-/// Returns the thread handle and the device's audio format, or None if the device isn't available.
+/// Returns the thread handle and the device's audio format, or the reason the
+/// device isn't available. Shows no UI; the caller decides how to report it.
 pub fn start_mic(
     audio_tx: SyncSender<AudioPacket>,
     stop_flag: Arc<AtomicBool>,
     session_epoch: i64,
-) -> Option<(JoinHandle<()>, AudioFormat)> {
-    start_capture_thread("mic", Direction::Capture, audio_tx, stop_flag, session_epoch)
+) -> Result<(JoinHandle<()>, AudioFormat), String> {
+    start_capture_thread("Microphone", Direction::Capture, audio_tx, stop_flag, session_epoch)
 }
 
 fn start_capture_thread(
@@ -45,8 +47,9 @@ fn start_capture_thread(
     audio_tx: SyncSender<AudioPacket>,
     stop_flag: Arc<AtomicBool>,
     session_epoch: i64,
-) -> Option<(JoinHandle<()>, AudioFormat)> {
-    // Use a channel to get the format back from the thread (or an error)
+) -> Result<(JoinHandle<()>, AudioFormat), String> {
+    // The device is opened on the capture thread (WASAPI objects stay on the
+    // thread that made them); it reports the format or the failure back here.
     let (fmt_tx, fmt_rx) = mpsc::channel::<Result<AudioFormat, String>>();
 
     let handle = std::thread::Builder::new()
@@ -54,96 +57,93 @@ fn start_capture_thread(
         .spawn(move || {
             let _ = wasapi::initialize_mta();
 
-            let result = run_capture(name, device_direction, &audio_tx, &stop_flag, &fmt_tx, session_epoch);
-            if let Err(e) = result {
-                crate::output::error(format!("{name}: capture error: {e}"));
+            match open_device(&device_direction) {
+                Ok(device) => {
+                    fmt_tx.send(Ok(device.format.clone())).ok();
+                    if let Err(e) = run_capture(device, &audio_tx, &stop_flag, session_epoch) {
+                        // Mid-recording failure (e.g. device unplugged): the mux pads
+                        // the track with silence, so the recording itself carries on.
+                        // Warn on a separate thread so stopping isn't held up by the dialog.
+                        let text = format!(
+                            "{name} stopped capturing: {e}\n\nThe recording continues without it."
+                        );
+                        std::thread::spawn(move || crate::output::warn(text));
+                    }
+                }
+                Err(e) => {
+                    fmt_tx.send(Err(e)).ok();
+                }
             }
 
             wasapi::deinitialize();
         })
-        .expect("failed to spawn audio thread");
+        .map_err(|e| e.to_string())?;
 
-    // Wait for the format report
     match fmt_rx.recv() {
-        Ok(Ok(format)) => Some((handle, format)),
+        Ok(Ok(format)) => Ok((handle, format)),
         Ok(Err(e)) => {
-            crate::output::error(format!("{name}: device not available: {e}"));
-            // Thread will exit on its own
             let _ = handle.join();
-            None
+            Err(e)
         }
         Err(_) => {
-            // Thread crashed before reporting
             let _ = handle.join();
-            None
+            Err("capture thread exited unexpectedly".into())
         }
     }
 }
 
-fn run_capture(
-    _name: &str,
-    device_direction: Direction,
-    audio_tx: &SyncSender<AudioPacket>,
-    stop_flag: &Arc<AtomicBool>,
-    fmt_tx: &mpsc::Sender<Result<AudioFormat, String>>,
-    session_epoch: i64,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let enumerator = DeviceEnumerator::new().inspect_err(|e| {
-        fmt_tx.send(Err(e.to_string())).ok();
-    })?;
+/// An opened, started WASAPI capture stream.
+struct OpenDevice {
+    audio_client: AudioClient,
+    capture_client: AudioCaptureClient,
+    event: Handle,
+    format: AudioFormat,
+}
 
-    let device = enumerator
-        .get_default_device(&device_direction)
-        .inspect_err(|e| {
-            fmt_tx.send(Err(e.to_string())).ok();
-        })?;
+/// Opens the default device for `direction` and starts capturing from it.
+/// For Render, this is a loopback capture of what the speakers are playing.
+fn open_device(direction: &Direction) -> Result<OpenDevice, String> {
+    let err = |e: wasapi::WasapiError| e.to_string();
 
-    let mut audio_client = device.get_iaudioclient().inspect_err(|e| {
-        fmt_tx.send(Err(e.to_string())).ok();
-    })?;
+    let enumerator = DeviceEnumerator::new().map_err(err)?;
+    let device = enumerator.get_default_device(direction).map_err(err)?;
+    let mut audio_client = device.get_iaudioclient().map_err(err)?;
+    let mix_format = audio_client.get_mixformat().map_err(err)?;
 
-    let mix_format = audio_client.get_mixformat().inspect_err(|e| {
-        fmt_tx.send(Err(e.to_string())).ok();
-    })?;
-
-    let sample_rate = mix_format.get_samplespersec();
-    let channels = mix_format.get_nchannels();
-    let bits = mix_format.get_bitspersample();
-    let block_align = mix_format.get_blockalign();
-
-    // For loopback: device_direction is Render, but we initialize with Direction::Capture
-    // This automatically sets AUDCLNT_STREAMFLAGS_LOOPBACK in the wasapi crate
-    let capture_direction = Direction::Capture;
+    // For loopback: direction is Render, but we initialize with Direction::Capture.
+    // This automatically sets AUDCLNT_STREAMFLAGS_LOOPBACK in the wasapi crate.
     let mode = StreamMode::EventsShared {
         autoconvert: true,
         buffer_duration_hns: 200_000, // 20ms buffer
     };
-
     audio_client
-        .initialize_client(&mix_format, &capture_direction, &mode)
-        .inspect_err(|e| {
-            fmt_tx.send(Err(e.to_string())).ok();
-        })?;
+        .initialize_client(&mix_format, &Direction::Capture, &mode)
+        .map_err(err)?;
+    let event = audio_client.set_get_eventhandle().map_err(err)?;
+    let capture_client = audio_client.get_audiocaptureclient().map_err(err)?;
+    audio_client.start_stream().map_err(err)?;
 
-    let event = audio_client.set_get_eventhandle().inspect_err(|e| {
-        fmt_tx.send(Err(e.to_string())).ok();
-    })?;
+    Ok(OpenDevice {
+        audio_client,
+        capture_client,
+        event,
+        format: AudioFormat {
+            sample_rate: mix_format.get_samplespersec(),
+            channels: mix_format.get_nchannels(),
+            bits_per_sample: mix_format.get_bitspersample(),
+            block_align: mix_format.get_blockalign(),
+        },
+    })
+}
 
-    let capture_client = audio_client.get_audiocaptureclient().inspect_err(|e| {
-        fmt_tx.send(Err(e.to_string())).ok();
-    })?;
-
-    // Report format back to main thread
-    let format = AudioFormat {
-        sample_rate,
-        channels,
-        bits_per_sample: bits,
-        block_align,
-    };
-    fmt_tx.send(Ok(format.clone())).ok();
-
-    // Start capturing
-    audio_client.start_stream()?;
+fn run_capture(
+    device: OpenDevice,
+    audio_tx: &SyncSender<AudioPacket>,
+    stop_flag: &Arc<AtomicBool>,
+    session_epoch: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let OpenDevice { audio_client, capture_client, event, format } = device;
+    let AudioFormat { sample_rate, block_align, .. } = format;
 
     let mut buf = vec![0u8; 4096 * block_align as usize];
     let epoch_100ns = crate::clock::ticks_to_100ns(session_epoch);

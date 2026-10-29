@@ -164,17 +164,23 @@ fn start_recording(
     let loopback_result = audio::start_loopback(loopback_tx, Arc::clone(&stop_flag), epoch);
     let mic_result = audio::start_mic(mic_tx, Arc::clone(&stop_flag), epoch);
 
+    // A missing device just drops its track. The warning is shown on its own
+    // thread: a message box here would block, and the session clock is already
+    // running, so the wait would end up in the recording as a frozen frame.
+    let warn_async = |text: String| {
+        std::thread::spawn(move || output::warn(text));
+    };
     let (loopback_handle, loopback_format) = match loopback_result {
-        Some((h, f)) => (Some(h), Some(f)),
-        None => {
-            output::warn("System audio (loopback) not available -- recording without it");
+        Ok((h, f)) => (Some(h), Some(f)),
+        Err(e) => {
+            warn_async(format!("No system audio device found -- recording without desktop audio.\n\n({e})"));
             (None, None)
         }
     };
     let (mic_handle, mic_format) = match mic_result {
-        Some((h, f)) => (Some(h), Some(f)),
-        None => {
-            output::warn("Microphone not available -- recording without it");
+        Ok((h, f)) => (Some(h), Some(f)),
+        Err(e) => {
+            warn_async(format!("No microphone found -- recording without the microphone track.\n\n({e})"));
             (None, None)
         }
     };
